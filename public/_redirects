@@ -1,0 +1,3 @@
+# Proxy /api/catalyst → Catalyst serverless function (avoids CORS in production).
+# The hosting server makes the request, so the browser sees a same-origin response.
+/api/catalyst  https://platform-60065907345.development.catalystserverless.in/server/FunctionFetch/execute  200
