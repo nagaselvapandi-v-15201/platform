@@ -1,8 +1,8 @@
 {
   "rewrites": [
     {
-      "source": "/api/catalyst",
-      "destination": "https://platform-60065907345.development.catalystserverless.in/server/FunctionFetch/execute"
+      "source": "/api/:path*",
+      "destination": "https://platform-60065907345.development.catalystserverless.in/server/FunctionFetch/execute/:path*"
     }
   ]
 }
