@@ -10,7 +10,7 @@ server: {
         target: 'https://platform-60065907345.development.catalystserverless.in',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, '/server/FunctionFetch/execute'),
-      }
-    }
-  }
+      },
+    },
+  },
 })
