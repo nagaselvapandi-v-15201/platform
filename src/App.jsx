@@ -4,7 +4,7 @@ import axios from "axios";
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
 const CATALYST_API_BASE =
   import.meta.env.VITE_API_BASE ??
-  "https://platform-60065907345.development.catalystserverless.in/server/FunctionFetch/execute";
+  "https://platform-60065907345.development.catalystserverless.in/server/FunctionFetch1/execute";
 const CACHE_KEY_PREFIX = "failure_logs_cache_";
 const CACHE_EXPIRY_MS = 5 * 60 * 1000;
 const PAGE_SIZE = 200;
