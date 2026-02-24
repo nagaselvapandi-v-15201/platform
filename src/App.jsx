@@ -3,7 +3,7 @@ import axios from "axios";
 
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
 // In FailureLogs.jsx — remove the proxy hack
-const CATALYST_API_BASE = "https://platform-60065907345.development.catalystserverless.in/server/FunctionFetch/execute";
+const CATALYST_API_BASE = "https://platform-60065907345.development.catalystserverless.in/server/CrmFunctionData/execute";
 const CACHE_KEY_PREFIX = "failure_logs_cache_";
 const CACHE_EXPIRY_MS = 5 * 60 * 1000;
 const PAGE_SIZE = 200;
@@ -168,7 +168,7 @@ async function fetchPageFromModule(moduleName, page = 1) {
   const cached = getFromCache(moduleName, page);
   if (cached) return cached;
   try {
-    const url = `${CATALYST_API_BASE}?module=${encodeURIComponent(moduleName)}&page=${page}&per_page=${PAGE_SIZE}`;
+    const url = `${CATALYST_API_BASE}?moduleValue=${encodeURIComponent(moduleName)}`;
     const response = await axios.get(url);
     const rawJson = response.data;
     const { data, hasMore } = parseCatalystResponse(rawJson);
