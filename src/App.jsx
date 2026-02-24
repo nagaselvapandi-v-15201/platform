@@ -3,6 +3,8 @@ import axios from "axios";
 
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
 const CATALYST_API_BASE = "https://platform-60065907345.development.catalystserverless.in/server/CrmFunctionData/execute";
+const SINGLE_RECORD_FETCH_URL = "https://platform-60065907345.development.catalystserverless.in/server/SigleRecordFetch/execute";
+const FETCH_WITH_RECORD_ID_URL = "https://platform-60065907345.development.catalystserverless.in/server/FetchwithRecordId/execute";
 const CACHE_KEY_PREFIX = "failure_logs_cache_";
 const CACHE_EXPIRY_MS = 5 * 60 * 1000;
 const PAGE_SIZE = 200;
@@ -192,6 +194,117 @@ async function fetchAllRecords() {
     all.push(...records); more = m; page++;
   }
   return all;
+}
+
+// ─── TWO-STEP TRACE FETCH ────────────────────────────────────────────────────
+/**
+ * Step 1: POST to SigleRecordFetch with threadId, requestId, crmRecordId, moduleValue
+ * Step 2: If success → POST to FetchwithRecordId with recordId, moduleValue
+ *         Parse response for Exception_trace and Error_message
+ * Returns: { Exception_trace, Error_message } or throws on failure
+ */
+async function fetchExceptionTrace(rec) {
+  // ── Step 1: Trigger the single-record fetch ──────────────────────────────
+  const step1Params = new URLSearchParams();
+  if (rec.threadid)        step1Params.set("threadId",    rec.threadid);
+  if (rec.requestid)       step1Params.set("requestId",   rec.requestid);
+  if (rec.id)              step1Params.set("crmRecordId", rec.id);
+  if (rec.Source_Module)   step1Params.set("moduleValue", rec.Source_Module);
+
+  const step1Url = `${SINGLE_RECORD_FETCH_URL}?${step1Params.toString()}`;
+  let step1Data;
+  try {
+    const res1 = await axios.get(step1Url);
+    step1Data = res1.data;
+  } catch (err) {
+    throw new Error(`Step 1 request failed: ${err?.message ?? "Network error"}`);
+  }
+
+  // Unwrap step 1 response — look for success indicator and a recordId
+  let step1Parsed;
+  try {
+    let d = step1Data;
+    if (typeof d === "string") d = JSON.parse(d);
+    // Try common wrapper shapes
+    const output = d?.output ?? d?.details?.output ?? d;
+    const inner  = typeof output === "string" ? JSON.parse(output) : output;
+    step1Parsed  = inner;
+  } catch {
+    step1Parsed = step1Data;
+  }
+
+  // Check for success — accept any truthy status/code/success field, or simply proceed if no error
+  const statusVal = step1Parsed?.status ?? step1Parsed?.code ?? step1Parsed?.success ?? step1Parsed?.result ?? "";
+  const isError   = String(statusVal).toLowerCase().includes("error") ||
+                    String(statusVal).toLowerCase().includes("fail");
+  if (isError) {
+    const msg = step1Parsed?.message ?? step1Parsed?.error ?? step1Parsed?.reason ?? JSON.stringify(step1Parsed).slice(0, 200);
+    throw new Error(`Step 1 returned error: ${msg}`);
+  }
+
+  // Extract the recordId returned by step 1 (may differ from original rec.id)
+  const pick = (...keys) => { for (const k of keys) { const v = step1Parsed?.[k]; if (v !== undefined && v !== null && v !== "") return String(v); } return null; };
+  const returnedRecordId = pick("recordId", "record_id", "id", "ID", "crmRecordId") ?? rec.id;
+
+  if (!returnedRecordId) {
+    throw new Error("Step 1 did not return a recordId to fetch details with.");
+  }
+
+  // ── Step 2: Fetch full record details by recordId ─────────────────────────
+  const step2Params = new URLSearchParams();
+  step2Params.set("recordId",    returnedRecordId);
+  step2Params.set("moduleValue", rec.Source_Module ?? "");
+
+  const step2Url = `${FETCH_WITH_RECORD_ID_URL}?${step2Params.toString()}`;
+  let step2Data;
+  try {
+    const res2 = await axios.get(step2Url);
+    step2Data = res2.data;
+  } catch (err) {
+    throw new Error(`Step 2 request failed: ${err?.message ?? "Network error"}`);
+  }
+
+  // ── Parse step 2 for Exception_trace and Error_message ───────────────────
+  let parsed2;
+  try {
+    let d = step2Data;
+    if (typeof d === "string") d = JSON.parse(d);
+    const output = d?.output ?? d?.details?.output ?? d;
+    const inner  = typeof output === "string" ? JSON.parse(output) : output;
+    // Could be array or object; if array take first element
+    parsed2 = Array.isArray(inner) ? (inner[0] ?? {}) : (inner?.data ?? inner ?? {});
+    if (Array.isArray(parsed2)) parsed2 = parsed2[0] ?? {};
+  } catch {
+    parsed2 = step2Data ?? {};
+  }
+
+  // Field-picking helper that covers common casing variants
+  const pickField = (...keys) => {
+    for (const k of keys) {
+      const v = parsed2?.[k];
+      if (v !== undefined && v !== null && v !== "") return String(v);
+    }
+    return null;
+  };
+
+  const exceptionTrace = pickField(
+    "Exception_trace", "exception_trace", "ExceptionTrace",
+    "stacktrace", "stack_trace", "StackTrace"
+  );
+  const errorMessage = pickField(
+    "Error_message", "error_message", "ErrorMessage",
+    "errormessage", "error", "message"
+  );
+  const reasonForException = pickField(
+    "Reason_for_the_exception", "reason_for_the_exception",
+    "ReasonForException", "reason", "failure_reason"
+  );
+
+  if (!exceptionTrace && !errorMessage && !reasonForException) {
+    throw new Error("Step 2 response did not contain Exception_trace or Error_message fields.");
+  }
+
+  return { Exception_trace: exceptionTrace, Error_message: errorMessage, Reason_for_the_exception: reasonForException };
 }
 
 // ─── HIERARCHY ───────────────────────────────────────────────────────────────
@@ -415,7 +528,6 @@ function GlobalSearchModal({ records, onClose, onOpenException, isDark }) {
     <div onClick={e => { if (e.target === e.currentTarget) onClose(); }}
       style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", backdropFilter: "blur(6px)", zIndex: 11000, display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "80px 20px 20px" }}>
       <div style={{ background: t.surface, border: `1px solid ${t.border2}`, borderRadius: 14, width: "100%", maxWidth: 720, maxHeight: "75vh", display: "flex", flexDirection: "column", overflow: "hidden", boxShadow: "0 32px 80px rgba(0,0,0,0.5)" }}>
-        {/* Search input */}
         <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 18px", borderBottom: `1px solid ${t.border}` }}>
           <span style={{ fontSize: 18, color: t.text3 }}>⌕</span>
           <input ref={inputRef} value={query} onChange={e => setQuery(e.target.value)}
@@ -424,8 +536,6 @@ function GlobalSearchModal({ records, onClose, onOpenException, isDark }) {
           <span style={{ fontSize: 11, color: t.text3, fontFamily: "monospace", background: t.surface2, border: `1px solid ${t.border}`, padding: "2px 8px", borderRadius: 4 }}>ESC</span>
           <button onClick={onClose} style={{ background: "none", border: `1px solid ${t.border}`, color: t.text2, width: 26, height: 26, borderRadius: 6, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13 }}>✕</button>
         </div>
-
-        {/* Results */}
         <div style={{ overflowY: "auto", flex: 1 }}>
           {query && results.length === 0 && (
             <div style={{ padding: 40, textAlign: "center", color: t.text3, fontSize: 13 }}>
@@ -505,6 +615,76 @@ function CountBadge({ count, red, t }) {
   );
 }
 
+// ─── GET TRACE BUTTON (with two-step fetch) ───────────────────────────────────
+function GetTraceButton({ rec, onFetch, t }) {
+  const [status, setStatus] = useState("idle"); // idle | step1 | step2 | done | error
+  const [errorMsg, setErrorMsg] = useState("");
+
+  const handleClick = async () => {
+    if (status === "step1" || status === "step2") return;
+    setStatus("step1");
+    setErrorMsg("");
+    try {
+      const traceData = await fetchExceptionTrace(rec);
+      setStatus("done");
+      onFetch(rec, traceData);
+    } catch (err) {
+      setStatus("error");
+      setErrorMsg(err?.message ?? "Unknown error");
+    }
+  };
+
+  const statusLabels = {
+    idle:  { text: "Get Exception Trace", icon: "⇣", spin: false },
+    step1: { text: "Locating record…",    icon: null, spin: true  },
+    step2: { text: "Fetching trace…",     icon: null, spin: true  },
+    done:  { text: "Trace Loaded ✓",      icon: "✓",  spin: false },
+    error: { text: "Retry",              icon: "⚠",  spin: false },
+  };
+  const s = statusLabels[status];
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+      <button
+        onClick={handleClick}
+        disabled={status === "step1" || status === "step2"}
+        style={{
+          display: "inline-flex", alignItems: "center", gap: 5,
+          fontSize: 10, fontWeight: 700,
+          color: status === "done" ? "#3fb950" : status === "error" ? "#ff6b6b" : t.accent,
+          background: status === "done" ? "rgba(63,185,80,0.08)" : status === "error" ? "rgba(255,107,107,0.08)" : `${t.accent}12`,
+          border: `1px solid ${status === "done" ? "rgba(63,185,80,0.4)" : status === "error" ? "rgba(255,107,107,0.4)" : `${t.accent}50`}`,
+          borderRadius: 4, padding: "3px 8px",
+          cursor: (status === "step1" || status === "step2") ? "not-allowed" : "pointer",
+          opacity: (status === "step1" || status === "step2") ? 0.6 : 1,
+          textTransform: "uppercase", letterSpacing: "0.4px",
+          transition: "all 0.2s",
+        }}
+      >
+        {s.spin
+          ? <span style={{ width: 8, height: 8, border: `1.5px solid ${t.accent}40`, borderTopColor: t.accent, borderRadius: "50%", display: "inline-block", animation: "spin 0.7s linear infinite" }} />
+          : s.icon && <span>{s.icon}</span>
+        }
+        <span>{s.text}</span>
+        {(status === "step1" || status === "step2") && (
+          <span style={{ fontSize: 9, color: t.text3, fontFamily: "monospace", marginLeft: 2 }}>
+            {status === "step1" ? "[1/2]" : "[2/2]"}
+          </span>
+        )}
+      </button>
+      {status === "error" && errorMsg && (
+        <div style={{
+          fontSize: 9, color: "#ff6b6b", fontFamily: "monospace",
+          background: "rgba(255,107,107,0.06)", border: "1px solid rgba(255,107,107,0.2)",
+          borderRadius: 3, padding: "3px 6px", maxWidth: 280, wordBreak: "break-all", lineHeight: 1.4
+        }}>
+          ⚠ {errorMsg}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RecordCard({ rec, onOpenException, onFetchTrace, t }) {
   const [idRevealed, setIdRevealed] = useState(false);
   const hasExc  = !!(rec.Exception_trace || rec.Error_message || rec.Reason_for_the_exception);
@@ -537,29 +717,16 @@ function RecordCard({ rec, onOpenException, onFetchTrace, t }) {
         </div>
       )}
 
-      {(hasExc || !hasTrace) && (
-        <div style={{ gridColumn: "1 / -1", display: "flex", alignItems: "center", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
-          {hasExc && (
-            <button onClick={() => onOpenException(rec)} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 10, fontWeight: 700, color: "#ff6b6b", background: "rgba(255,107,107,0.08)", border: "1px solid rgba(255,107,107,0.35)", borderRadius: 4, padding: "3px 8px", cursor: "pointer", letterSpacing: "0.4px", textTransform: "uppercase" }}>
-              <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#ff6b6b", display: "inline-block", animation: "excPulse 1.8s infinite" }} />
-              ⚠ Exception Details
-            </button>
-          )}
-          {!hasTrace && <GetTraceButton rec={rec} onFetch={onFetchTrace} t={t} />}
-        </div>
-      )}
+      <div style={{ gridColumn: "1 / -1", display: "flex", alignItems: "flex-start", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+        {hasExc && (
+          <button onClick={() => onOpenException(rec)} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 10, fontWeight: 700, color: "#ff6b6b", background: "rgba(255,107,107,0.08)", border: "1px solid rgba(255,107,107,0.35)", borderRadius: 4, padding: "3px 8px", cursor: "pointer", letterSpacing: "0.4px", textTransform: "uppercase" }}>
+            <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#ff6b6b", display: "inline-block", animation: "excPulse 1.8s infinite" }} />
+            ⚠ Exception Details
+          </button>
+        )}
+        {!hasTrace && <GetTraceButton rec={rec} onFetch={onFetchTrace} t={t} />}
+      </div>
     </div>
-  );
-}
-
-function GetTraceButton({ rec, onFetch, t }) {
-  const [loading, setLoading] = useState(false);
-  const handleClick = async () => { setLoading(true); await onFetch(rec); setLoading(false); };
-  return (
-    <button onClick={handleClick} disabled={loading} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 10, fontWeight: 700, color: t.accent, background: `${t.accent}12`, border: `1px solid ${t.accent}50`, borderRadius: 4, padding: "3px 8px", cursor: loading ? "not-allowed" : "pointer", opacity: loading ? 0.5 : 1, textTransform: "uppercase", letterSpacing: "0.4px" }}>
-      {loading ? <span style={{ width: 8, height: 8, border: `1.5px solid ${t.accent}40`, borderTopColor: t.accent, borderRadius: "50%", display: "inline-block", animation: "spin 0.7s linear infinite" }} /> : "⇣"}
-      <span>{loading ? "Fetching…" : "Get Exception Trace"}</span>
-    </button>
   );
 }
 
@@ -692,7 +859,6 @@ function ExceptionModal({ rec, onClose, onAnalyze, t }) {
           <button onClick={onClose} style={{ background: "none", border: `1px solid ${t.modalBorder}`, color: "#a06060", fontSize: 13, width: 28, height: 28, borderRadius: 6, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>✕</button>
         </div>
 
-        {/* Pattern matches summary */}
         {matches.length > 0 && (
           <div style={{ padding: "8px 16px", background: `${t.modalHeaderBg}`, borderBottom: `1px solid ${t.modalBorder}`, display: "flex", gap: 6, flexWrap: "wrap" }}>
             {matches.map((m, i) => {
@@ -757,7 +923,6 @@ function ChatWindow({ contextRec, onClose }) {
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
-  // Drag
   const onMouseDown = e => {
     dragging.current = true;
     dragOffset.current = { x: e.clientX - pos.current.x, y: e.clientY - pos.current.y };
@@ -789,10 +954,7 @@ function ChatWindow({ contextRec, onClose }) {
     setInput("");
     setAnalyzing(true);
     setMessages(prev => [...prev, { role: "user", content: text }]);
-
-    // Brief delay to show the typing indicator feels responsive
     await new Promise(r => setTimeout(r, 380));
-
     let reply;
     if (!contextRec) {
       reply = { role: "ai", content: "⚠ No exception record loaded. Open an exception modal and click <strong>Analyze Exception</strong> first.", error: true, isHtml: true };
@@ -807,7 +969,6 @@ function ChatWindow({ contextRec, onClose }) {
   const showWelcome = messages.length === 0;
   const msgCount = messages.length;
 
-  // Pre-analysis for welcome panel
   const preAnalysis = contextRec ? (() => {
     const { matches } = analyzeException(contextRec);
     const frames  = extractStackFrames(contextRec.Exception_trace);
@@ -815,12 +976,8 @@ function ChatWindow({ contextRec, onClose }) {
     return { matches, frames, classes };
   })() : null;
 
-  const SEV_COLOR = { critical: "#ef4444", high: "#f97316", medium: "#eab308" };
-
   return (
     <div style={{ position: "fixed", top: position.y, left: position.x, width: 440, maxHeight: "82vh", minHeight: 380, background: "#0d0a05", border: "1px solid rgba(217,119,6,0.28)", borderRadius: 14, boxShadow: "0 24px 80px rgba(0,0,0,0.85)", display: "flex", flexDirection: "column", zIndex: 10001, overflow: "hidden" }}>
-
-      {/* Header (draggable) */}
       <div onMouseDown={onMouseDown} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 14px", background: "linear-gradient(135deg,#0d0900,#1a1000)", borderBottom: "1px solid rgba(217,119,6,0.18)", cursor: "move", flexShrink: 0, userSelect: "none" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 28, height: 28, borderRadius: 8, background: "rgba(217,119,6,0.12)", border: "1px solid rgba(217,119,6,0.25)", display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -840,7 +997,6 @@ function ChatWindow({ contextRec, onClose }) {
         </div>
       </div>
 
-      {/* Context bar */}
       {contextRec && (
         <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "5px 14px", background: "rgba(217,119,6,0.05)", borderBottom: "1px solid rgba(217,119,6,0.1)", flexShrink: 0, flexWrap: "wrap" }}>
           {[["Flow", contextRec.Flow_Type], ["HTTP", contextRec.Statuscode], ["Server", contextRec.ServerName]].filter(f => f[1]).map(f => (
@@ -852,7 +1008,6 @@ function ChatWindow({ contextRec, onClose }) {
         </div>
       )}
 
-      {/* Messages */}
       <div style={{ flex: 1, overflowY: "auto", padding: "12px 14px", display: "flex", flexDirection: "column", gap: 10, minHeight: 0 }}>
         {showWelcome ? (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, padding: "16px 0", textAlign: "center", flex: 1 }}>
@@ -863,7 +1018,6 @@ function ChatWindow({ contextRec, onClose }) {
                 ? `Pattern library loaded for ${contextRec.Name}. Use quick prompts or type a question.`
                 : "Open an exception record and click Analyze Exception."}
             </div>
-            {/* Pre-analysis panel */}
             {contextRec && preAnalysis && preAnalysis.matches.length > 0 && (
               <div style={{ width: "100%", background: "rgba(217,119,6,0.06)", border: "1px solid rgba(217,119,6,0.15)", borderRadius: 8, padding: "10px 12px", textAlign: "left", marginTop: 6 }}>
                 <div style={{ fontSize: 9, fontWeight: 700, color: "#a06010", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 7 }}>
@@ -916,7 +1070,6 @@ function ChatWindow({ contextRec, onClose }) {
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Quick chips — shown only on welcome screen */}
       {showWelcome && contextRec && (
         <div style={{ display: "flex", flexWrap: "wrap", gap: 5, padding: "6px 14px 4px", borderTop: "1px solid rgba(217,119,6,0.1)", flexShrink: 0 }}>
           {QUICK_PROMPTS.map(({ label, text }) => (
@@ -927,7 +1080,6 @@ function ChatWindow({ contextRec, onClose }) {
         </div>
       )}
 
-      {/* Input */}
       <div style={{ padding: "8px 12px 10px", borderTop: "1px solid rgba(217,119,6,0.15)", background: "rgba(0,0,0,0.25)", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
           <textarea value={input} onChange={e => setInput(e.target.value)}
@@ -957,7 +1109,6 @@ export default function FailureLogs() {
   const [allExpanded, setAllExpanded] = useState(false);
   const [isDark, setIsDark]         = useState(true);
 
-  // Filters
   const [searchQuery, setSearchQuery] = useState("");
   const [flowFilters, setFlowFilters] = useState({ Publish: true, Signup: true, Invite: true, Upgrade: true });
   const [dateFrom, setDateFrom]       = useState("");
@@ -965,10 +1116,8 @@ export default function FailureLogs() {
   const [errCode, setErrCode]         = useState("");
   const [quickView, setQuickView]     = useState("all");
 
-  // Global search
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
 
-  // Modal / chat
   const [modalRec, setModalRec]   = useState(null);
   const [chatOpen, setChatOpen]   = useState(false);
   const [chatRec, setChatRec]     = useState(null);
@@ -1028,7 +1177,26 @@ export default function FailureLogs() {
 
   const totalVisible = tree.reduce((s, d) => s + d.count, 0);
 
-  const handleFetchTrace = useCallback(async (rec) => { setModalRec({ ...rec }); }, []);
+  /**
+   * Called by GetTraceButton after the two-step fetch succeeds.
+   * Merges the fetched trace data into the record and opens the Exception modal.
+   */
+  const handleFetchTrace = useCallback((rec, traceData) => {
+    // Merge fetched fields into the record
+    const enriched = {
+      ...rec,
+      Exception_trace:          traceData.Exception_trace          ?? rec.Exception_trace,
+      Error_message:            traceData.Error_message            ?? rec.Error_message,
+      Reason_for_the_exception: traceData.Reason_for_the_exception ?? rec.Reason_for_the_exception,
+    };
+
+    // Update the record in rawRecords so the UI reflects new data everywhere
+    setRawRecords(prev => prev.map(r => r.id === rec.id && r.Source_Module === rec.Source_Module ? enriched : r));
+
+    // Open the Exception Details modal with the enriched record
+    setModalRec(enriched);
+  }, []);
+
   const resetFilters = () => { setSearchQuery(""); setDateFrom(""); setDateTo(""); setErrCode(""); setFlowFilters({ Publish: true, Signup: true, Invite: true, Upgrade: true }); setQuickView("all"); };
 
   const QUICK_VIEWS = [
@@ -1066,16 +1234,13 @@ export default function FailureLogs() {
             <div style={{ width: 28, height: 28, background: `linear-gradient(135deg, ${t.accent}, ${t.accent2})`, borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14 }}>⚡</div>
             FAILURE_LOGS
           </div>
-
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-            {/* Global Search Button */}
             <button onClick={() => setGlobalSearchOpen(true)}
               style={{ display: "flex", alignItems: "center", gap: 8, background: t.surface2, border: `1px solid ${t.border}`, borderRadius: 8, color: t.text2, fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, padding: "6px 14px", cursor: "pointer", minWidth: 200 }}>
               <span style={{ fontSize: 13 }}>⌕</span>
               <span>Search all records…</span>
               <span style={{ marginLeft: "auto", fontSize: 10, opacity: 0.5, background: t.surface3, border: `1px solid ${t.border}`, borderRadius: 4, padding: "1px 5px" }}>⌘K</span>
             </button>
-
             {[
               { dot: t.red,   label: `${rawRecords.length} total failures` },
               { dot: t.green, label: `${tree.length} domains` },
@@ -1085,8 +1250,6 @@ export default function FailureLogs() {
                 {label}
               </div>
             ))}
-
-            {/* Theme toggle */}
             <button onClick={() => setIsDark(v => !v)}
               style={{ display: "flex", alignItems: "center", gap: 6, background: t.surface2, border: `1px solid ${t.border}`, borderRadius: 8, color: t.text2, fontSize: 13, padding: "6px 10px", cursor: "pointer", transition: "all 0.2s" }}
               title={isDark ? "Switch to Light Mode" : "Switch to Dark Mode"}>
@@ -1099,8 +1262,6 @@ export default function FailureLogs() {
 
           {/* SIDEBAR */}
           <div style={{ width: 280, minWidth: 280, background: t.surface, borderRight: `1px solid ${t.border}`, padding: 20, overflowY: "auto", display: "flex", flexDirection: "column", gap: 24 }}>
-
-            {/* Quick View */}
             <div>
               <div style={{ fontSize: 10, fontFamily: "'IBM Plex Mono', monospace", letterSpacing: "0.1em", color: t.text3, textTransform: "uppercase", marginBottom: 10 }}>Quick View</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
@@ -1119,7 +1280,6 @@ export default function FailureLogs() {
               </div>
             </div>
 
-            {/* Search */}
             <div>
               <div style={{ fontSize: 10, fontFamily: "'IBM Plex Mono', monospace", letterSpacing: "0.1em", color: t.text3, textTransform: "uppercase", marginBottom: 10 }}>Filter by Name/ZOID</div>
               <div style={{ position: "relative" }}>
@@ -1129,7 +1289,6 @@ export default function FailureLogs() {
               </div>
             </div>
 
-            {/* Flow Type */}
             <div>
               <div style={{ fontSize: 10, fontFamily: "'IBM Plex Mono', monospace", letterSpacing: "0.1em", color: t.text3, textTransform: "uppercase", marginBottom: 10 }}>Flow Type</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -1143,7 +1302,6 @@ export default function FailureLogs() {
               </div>
             </div>
 
-            {/* Date Range */}
             <div>
               <div style={{ fontSize: 10, fontFamily: "'IBM Plex Mono', monospace", letterSpacing: "0.1em", color: t.text3, textTransform: "uppercase", marginBottom: 10 }}>Date Range</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -1157,7 +1315,6 @@ export default function FailureLogs() {
               </div>
             </div>
 
-            {/* Status Code */}
             <div>
               <div style={{ fontSize: 10, fontFamily: "'IBM Plex Mono', monospace", letterSpacing: "0.1em", color: t.text3, textTransform: "uppercase", marginBottom: 10 }}>Status Code</div>
               <div style={{ position: "relative" }}>
@@ -1212,7 +1369,6 @@ export default function FailureLogs() {
         </div>
       </div>
 
-      {/* GLOBAL SEARCH */}
       {globalSearchOpen && (
         <GlobalSearchModal
           records={rawRecords}
@@ -1222,7 +1378,6 @@ export default function FailureLogs() {
         />
       )}
 
-      {/* EXCEPTION MODAL */}
       {modalRec && (
         <ExceptionModal
           rec={modalRec}
@@ -1232,7 +1387,6 @@ export default function FailureLogs() {
         />
       )}
 
-      {/* CHAT WINDOW */}
       {chatOpen && (
         <ChatWindow contextRec={chatRec} onClose={() => setChatOpen(false)} />
       )}
