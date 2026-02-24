@@ -267,60 +267,92 @@ function extractClasses(trace) {
   return [...hits].slice(0, 6);
 }
 
-// Build context string for Claude API
-function buildExceptionContext(rec) {
-  const { matches } = analyzeException(rec);
-  const frames = extractStackFrames(rec.Exception_trace);
-  const classes = extractClasses(rec.Exception_trace);
+// ─── LOCAL ANALYSIS HTML BUILDER ─────────────────────────────────────────────
+const SEVERITY_STYLE = {
+  critical: { color: "#ff6b6b", label: "🔴 CRITICAL", bg: "rgba(255,107,107,0.1)" },
+  high:     { color: "#f0883e", label: "🟠 HIGH",     bg: "rgba(240,136,62,0.1)"  },
+  medium:   { color: "#FBBF24", label: "🟡 MEDIUM",   bg: "rgba(251,191,36,0.1)"  },
+  low:      { color: "#3fb950", label: "🟢 LOW",      bg: "rgba(63,185,80,0.1)"   },
+  info:     { color: "#58a6ff", label: "🔵 INFO",     bg: "rgba(88,166,255,0.1)"  },
+};
 
-  return `=== EXCEPTION RECORD ===
-Name: ${rec.Name ?? "–"}
-ZOID: ${rec.ZOID ?? "–"}
-ZUID: ${rec.ZUID ?? "–"}
-Flow Type: ${rec.Flow_Type ?? "–"}
-HTTP Status: ${rec.Statuscode ?? "–"}
-Server: ${rec.ServerName ?? "–"}
-Thread ID: ${rec.threadid ?? "–"}
-Request ID: ${rec.requestid ?? "–"}
-Build ID: ${rec.BuildID ?? "–"}
-Changeset: ${rec.Changeset ?? "–"}
-Request Time: ${formatTs(rec.Request_Time ?? rec.Created_Time)}
-Source Module: ${rec.Source_Module ?? "–"}
+function formatAnalysisHTML(rec, userQuestion) {
+  const { corpus, matches } = analyzeException(rec);
+  const q = (userQuestion || "").toLowerCase();
 
-=== ERROR MESSAGE ===
-${rec.Error_message ?? "N/A"}
+  const wantsRootCause = /root.?cause|why|what.*caus|reason/i.test(q);
+  const wantsFix       = /fix|solve|resolv|solution|how to|suggest/i.test(q);
+  const wantsTrace     = /trace|stack|step|explain|walk.*through|frame/i.test(q);
+  const wantsKnown     = /known|bug|pattern|similar|common/i.test(q);
+  const wantsSummary   = /summar|overview|what is|tell me|analyz/i.test(q);
+  const showAll        = !wantsRootCause && !wantsFix && !wantsTrace && !wantsKnown;
 
-=== REASON FOR EXCEPTION ===
-${rec.Reason_for_the_exception ?? "N/A"}
+  const sev   = matches[0]?.severity ?? "info";
+  const style = SEVERITY_STYLE[sev] ?? SEVERITY_STYLE.info;
 
-=== EXCEPTION TRACE ===
-${rec.Exception_trace ?? "N/A"}
+  let html = `<div style="background:${style.bg};border:1px solid ${style.color};border-radius:6px;padding:8px 10px;margin-bottom:10px">
+    <span style="font-weight:700;color:${style.color}">${style.label}</span>
+    &nbsp;·&nbsp;
+    <span style="color:#ccc;font-size:10px">${escHtml(rec.Flow_Type ?? "")} · HTTP ${escHtml(rec.Statuscode ?? "–")} · ${escHtml(rec.ServerName ?? "–")}</span>
+  </div>`;
 
-=== PRE-ANALYZED PATTERN MATCHES ===
-${matches.length > 0 ? matches.map(m => `• ${m.title} [${m.severity.toUpperCase()}]: ${m.rootCause}`).join("\n") : "No known patterns matched."}
+  if (!matches.length) {
+    html += `<div style="color:#a0a0a0;font-size:11px">No known exception pattern matched.</div><br>`;
+    if (rec.Error_message)   html += `<strong>Error Message:</strong><br><pre>${escHtml(rec.Error_message.slice(0, 600))}</pre>`;
+    if (rec.Exception_trace) html += `<strong>Top Stack Frames:</strong><br><pre>${escHtml(extractStackFrames(rec.Exception_trace).join("\n"))}</pre>`;
+    return html;
+  }
 
-=== TOP STACK FRAMES ===
-${frames.length > 0 ? frames.join("\n") : "No parseable frames."}
+  matches.forEach((match, idx) => {
+    if (idx > 0) html += `<hr style="border-color:rgba(255,255,255,0.08);margin:10px 0">`;
+    const ms = SEVERITY_STYLE[match.severity] ?? SEVERITY_STYLE.info;
 
-=== CLASSES INVOLVED ===
-${classes.join(", ") || "N/A"}`;
-}
+    html += `<div style="font-size:11px;font-weight:700;color:${ms.color};margin-bottom:6px">
+      ${idx === 0 ? "🎯" : "🔎"} ${escHtml(match.title)}
+    </div>`;
 
-// ─── CLAUDE API CHAT ─────────────────────────────────────────────────────────
-async function callClaudeAPI(messages, systemPrompt) {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      system: systemPrompt,
-      messages: messages,
-    })
+    if (wantsRootCause || wantsSummary || showAll)
+      html += `<div style="margin-bottom:6px">
+        <span style="color:#FBBF24;font-weight:700;font-size:10px">ROOT CAUSE</span><br>
+        <span style="color:#e0d0b0">${escHtml(match.rootCause)}</span>
+      </div>`;
+
+    if (wantsFix || wantsSummary || showAll)
+      html += `<div style="margin-bottom:6px">
+        <span style="color:#3fb950;font-weight:700;font-size:10px">SUGGESTED FIX</span><br>
+        <span style="color:#b0e0b8">${escHtml(match.fix)}</span>
+      </div>`;
+
+    if (wantsKnown || showAll)
+      html += `<div style="margin-bottom:4px">
+        <span style="color:#58a6ff;font-weight:700;font-size:10px">PATTERN</span>&nbsp;
+        <code style="font-size:9px;background:rgba(88,166,255,0.08);padding:1px 4px;border-radius:3px">${escHtml(match.patterns.map(p => p.toString().replace(/\/[gi]*$/, "").replace(/^\//, "")).join(" | "))}</code>
+      </div>`;
   });
-  if (!response.ok) throw new Error(`API error: ${response.status}`);
-  const data = await response.json();
-  return data.content?.map(b => b.text || "").join("") || "";
+
+  if ((wantsTrace || showAll) && rec.Exception_trace) {
+    const frames  = extractStackFrames(rec.Exception_trace);
+    const classes = extractClasses(rec.Exception_trace);
+    html += `<hr style="border-color:rgba(255,255,255,0.08);margin:10px 0">
+    <div style="color:#FBBF24;font-weight:700;font-size:10px;margin-bottom:4px">📋 TOP STACK FRAMES</div>
+    <pre style="font-size:9.5px;line-height:1.6;background:rgba(0,0,0,0.3);padding:8px;border-radius:4px;overflow-x:auto">${escHtml(frames.join("\n") || "No parseable frames found.")}</pre>`;
+    if (classes.length)
+      html += `<div style="color:#58a6ff;font-size:10px;margin-top:4px">
+        <strong>Classes involved:</strong> ${classes.map(c => `<code style="background:rgba(88,166,255,0.08);padding:1px 4px;border-radius:3px">${escHtml(c)}</code>`).join(" · ")}
+      </div>`;
+  }
+
+  if (showAll || wantsSummary)
+    html += `<hr style="border-color:rgba(255,255,255,0.08);margin:10px 0">
+    <div style="color:#888;font-size:9.5px;line-height:1.8">
+      <strong style="color:#aaa">Record:</strong> ${escHtml(rec.Name ?? "–")}&nbsp;&nbsp;
+      <strong style="color:#aaa">ZOID:</strong> ${escHtml(rec.ZOID ?? "–")}&nbsp;&nbsp;
+      <strong style="color:#aaa">Build:</strong> ${escHtml(rec.BuildID ?? "–")}&nbsp;&nbsp;
+      <strong style="color:#aaa">Changeset:</strong> ${escHtml(rec.Changeset ?? "–")}&nbsp;&nbsp;
+      <strong style="color:#aaa">Thread:</strong> ${escHtml(rec.threadid ?? "–")}
+    </div>`;
+
+  return html;
 }
 
 // ─── THEME ───────────────────────────────────────────────────────────────────
@@ -697,7 +729,7 @@ function ExceptionModal({ rec, onClose, onAnalyze, t }) {
         <div style={{ padding: "12px 20px", borderTop: `1px solid ${t.modalBorder}`, background: t.modalHeaderBg, display: "flex", justifyContent: "flex-end", gap: 10, flexShrink: 0 }}>
           {fields.length > 0 && (
             <button onClick={() => onAnalyze(rec)} style={{ display: "inline-flex", alignItems: "center", gap: 7, fontSize: 11, fontWeight: 700, color: "#D97706", background: "rgba(217,119,6,0.08)", border: "1px solid rgba(217,119,6,0.35)", borderRadius: 5, padding: "6px 14px", cursor: "pointer", letterSpacing: "0.4px", textTransform: "uppercase", marginRight: "auto" }}>
-              ✦ Analyze with Claude AI
+              ✦ Analyze Exception
             </button>
           )}
           {logsUrl && (
@@ -712,117 +744,97 @@ function ExceptionModal({ rec, onClose, onAnalyze, t }) {
   );
 }
 
-// ─── CHAT WINDOW (Claude API powered) ─────────────────────────────────────────
+// ─── CHAT WINDOW (100% local — no API) ───────────────────────────────────────
 function ChatWindow({ contextRec, onClose }) {
-  const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState("");
-  const [streaming, setStreaming] = useState(false);
-  const [apiError, setApiError] = useState(null);
+  const [messages,  setMessages]  = useState([]);
+  const [input,     setInput]     = useState("");
+  const [analyzing, setAnalyzing] = useState(false);
   const messagesEndRef = useRef(null);
-  const pos = useRef({ x: Math.max(20, window.innerWidth - 520), y: 80 });
-  const [position, setPosition] = useState({ x: Math.max(20, window.innerWidth - 520), y: 80 });
-  const dragging = useRef(false);
-  const offset = useRef({ x: 0, y: 0 });
-  const apiMessages = useRef([]);
+  const pos    = useRef({ x: Math.max(20, window.innerWidth - 480), y: 80 });
+  const [position, setPosition] = useState({ x: Math.max(20, window.innerWidth - 480), y: 80 });
+  const dragging   = useRef(false);
+  const dragOffset = useRef({ x: 0, y: 0 });
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
-  const onMouseDown = (e) => { dragging.current = true; offset.current = { x: e.clientX - pos.current.x, y: e.clientY - pos.current.y }; e.preventDefault(); };
+  // Drag
+  const onMouseDown = e => {
+    dragging.current = true;
+    dragOffset.current = { x: e.clientX - pos.current.x, y: e.clientY - pos.current.y };
+    e.preventDefault();
+  };
   useEffect(() => {
-    const onMove = (e) => {
+    const onMove = e => {
       if (!dragging.current) return;
-      const nx = Math.max(0, Math.min(window.innerWidth - 460, e.clientX - offset.current.x));
-      const ny = Math.max(0, Math.min(window.innerHeight - 400, e.clientY - offset.current.y));
-      pos.current = { x: nx, y: ny }; setPosition({ x: nx, y: ny });
+      const nx = Math.max(0, Math.min(window.innerWidth  - 440, e.clientX - dragOffset.current.x));
+      const ny = Math.max(0, Math.min(window.innerHeight - 400, e.clientY - dragOffset.current.y));
+      pos.current = { x: nx, y: ny };
+      setPosition({ x: nx, y: ny });
     };
     const onUp = () => { dragging.current = false; };
-    document.addEventListener("mousemove", onMove); document.addEventListener("mouseup", onUp);
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup",   onUp);
     return () => { document.removeEventListener("mousemove", onMove); document.removeEventListener("mouseup", onUp); };
   }, []);
 
-  const SYSTEM_PROMPT = contextRec ? `You are an expert Java/CRM platform exception analyzer. You have deep knowledge of Zoho CRM platform internals, Java exceptions, and distributed system failures.
-
-The user is analyzing a specific exception record from the CRM failure logs system. Here is the complete context:
-
-${buildExceptionContext(contextRec)}
-
-Your role:
-1. Provide detailed, actionable analysis of this specific exception
-2. Identify the ROOT CAUSE based on the actual stack trace and error messages
-3. Give SPECIFIC, ACTIONABLE fixes (not generic advice)
-4. Reference specific class names, method names, and line numbers from the trace when relevant
-5. Explain how the different matched patterns relate to each other (e.g., layout failure causing publish failure)
-6. Suggest debugging steps, what logs to check, what metrics to monitor
-7. If you see a cascade of failures, explain the chain
-
-Format your responses clearly with sections. Be concise but thorough. Use code formatting for class names and stack frames.` :
-`You are an expert exception analyzer. No exception record is loaded yet. Ask the user to open an exception and click "Analyze with Claude AI" first.`;
-
   const QUICK_PROMPTS = [
-    { label: "🎯 Root cause analysis", text: "Analyze this exception and identify the exact root cause, citing specific stack frames" },
-    { label: "🔧 Step-by-step fix", text: "What is the most likely fix for this error? Give me specific steps to resolve it" },
-    { label: "📋 Explain the trace", text: "Walk me through this stack trace step by step — what happened, in what order, and why it failed" },
-    { label: "🐛 Known patterns", text: "Is this a known bug pattern? Are there similar issues, and what do the matched exception patterns tell us?" },
-    { label: "🔍 Debug checklist", text: "Give me a debugging checklist: what logs to check, what metrics to look at, and what queries to run" },
-    { label: "⚡ Impact assessment", text: "What is the likely user/business impact of this failure and how urgent is it to fix?" },
+    { label: "🔍 Root cause",    text: "Analyze this exception and identify the root cause" },
+    { label: "🔧 Suggest fix",   text: "What is the most likely fix for this error?" },
+    { label: "📖 Explain trace", text: "Explain this stack trace step by step" },
+    { label: "🐛 Known issues",  text: "Is this a known bug pattern? What similar issues exist?" },
   ];
 
-  const sendMessage = async (text) => {
-    if (streaming || !text.trim()) return;
-    setInput(""); setStreaming(true); setApiError(null);
+  const sendMessage = async text => {
+    if (analyzing || !text.trim()) return;
+    setInput("");
+    setAnalyzing(true);
+    setMessages(prev => [...prev, { role: "user", content: text }]);
 
-    const userMsg = { role: "user", content: text };
-    setMessages(prev => [...prev, userMsg]);
-    apiMessages.current = [...apiMessages.current, { role: "user", content: text }];
+    // Brief delay to show the typing indicator feels responsive
+    await new Promise(r => setTimeout(r, 380));
 
-    try {
-      const reply = await callClaudeAPI(apiMessages.current, SYSTEM_PROMPT);
-      const aiMsg = { role: "assistant", content: reply };
-      apiMessages.current = [...apiMessages.current, aiMsg];
-      setMessages(prev => [...prev, { role: "ai", content: reply, isMarkdown: true }]);
-    } catch (err) {
-      setApiError(err.message);
-      setMessages(prev => [...prev, { role: "ai", content: `API Error: ${err.message}. Check your network or API key.`, error: true }]);
+    let reply;
+    if (!contextRec) {
+      reply = { role: "ai", content: "⚠ No exception record loaded. Open an exception modal and click <strong>Analyze Exception</strong> first.", error: true, isHtml: true };
+    } else {
+      reply = { role: "ai", content: formatAnalysisHTML(contextRec, text), isHtml: true };
     }
-    setStreaming(false);
+    setMessages(prev => [...prev, reply]);
+    setAnalyzing(false);
   };
 
-  const clearChat = () => { setMessages([]); apiMessages.current = []; setApiError(null); };
-
-  // Simple markdown to HTML for responses
-  const renderContent = (content) => {
-    if (!content) return "";
-    return content
-      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-      .replace(/`([^`]+)`/g, '<code style="background:rgba(255,255,255,0.1);padding:1px 4px;border-radius:3px;font-size:0.9em">$1</code>')
-      .replace(/^### (.*$)/gm, '<div style="font-weight:700;color:#FBBF24;margin:10px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:0.5px">$1</div>')
-      .replace(/^## (.*$)/gm, '<div style="font-weight:700;color:#FBBF24;margin:12px 0 6px;font-size:13px">$1</div>')
-      .replace(/^# (.*$)/gm, '<div style="font-weight:700;color:#FBBF24;margin:12px 0 6px;font-size:14px">$1</div>')
-      .replace(/^• (.*$)/gm, '<div style="padding-left:12px;margin:2px 0">• $1</div>')
-      .replace(/^- (.*$)/gm, '<div style="padding-left:12px;margin:2px 0">• $1</div>')
-      .replace(/^\d+\. (.*$)/gm, (m, p1) => `<div style="padding-left:12px;margin:2px 0">${m.match(/^\d+/)[0]}. ${p1}</div>`)
-      .replace(/\n\n/g, '<br><br>')
-      .replace(/\n/g, '<br>');
-  };
-
+  const clearChat = () => setMessages([]);
+  const showWelcome = messages.length === 0;
   const msgCount = messages.length;
 
+  // Pre-analysis for welcome panel
+  const preAnalysis = contextRec ? (() => {
+    const { matches } = analyzeException(contextRec);
+    const frames  = extractStackFrames(contextRec.Exception_trace);
+    const classes = extractClasses(contextRec.Exception_trace);
+    return { matches, frames, classes };
+  })() : null;
+
+  const SEV_COLOR = { critical: "#ef4444", high: "#f97316", medium: "#eab308" };
+
   return (
-    <div style={{ position: "fixed", top: position.y, left: position.x, width: 460, maxHeight: "82vh", minHeight: 400, background: "#0d0a05", border: "1px solid rgba(217,119,6,0.28)", borderRadius: 14, boxShadow: "0 24px 80px rgba(0,0,0,0.85)", display: "flex", flexDirection: "column", zIndex: 10001, overflow: "hidden" }}>
-      {/* Header */}
+    <div style={{ position: "fixed", top: position.y, left: position.x, width: 440, maxHeight: "82vh", minHeight: 380, background: "#0d0a05", border: "1px solid rgba(217,119,6,0.28)", borderRadius: 14, boxShadow: "0 24px 80px rgba(0,0,0,0.85)", display: "flex", flexDirection: "column", zIndex: 10001, overflow: "hidden" }}>
+
+      {/* Header (draggable) */}
       <div onMouseDown={onMouseDown} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 14px", background: "linear-gradient(135deg,#0d0900,#1a1000)", borderBottom: "1px solid rgba(217,119,6,0.18)", cursor: "move", flexShrink: 0, userSelect: "none" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 28, height: 28, borderRadius: 8, background: "rgba(217,119,6,0.12)", border: "1px solid rgba(217,119,6,0.25)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2z" fill="url(#cg)" /><defs><linearGradient id="cg" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse"><stop offset="0%" stopColor="#D97706"/><stop offset="50%" stopColor="#F59E0B"/><stop offset="100%" stopColor="#FBBF24"/></linearGradient></defs></svg>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2z" fill="url(#cg)"/><defs><linearGradient id="cg" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse"><stop offset="0%" stopColor="#D97706"/><stop offset="50%" stopColor="#F59E0B"/><stop offset="100%" stopColor="#FBBF24"/></linearGradient></defs></svg>
           </div>
           <div>
-            <div style={{ fontSize: 13, fontWeight: 700, color: "#FBBF24", letterSpacing: "0.3px" }}>Exception Analyzer <span style={{ fontSize: 9, color: "#a06010", background: "rgba(217,119,6,0.15)", border: "1px solid rgba(217,119,6,0.3)", borderRadius: 3, padding: "1px 5px", marginLeft: 4, verticalAlign: "middle" }}>Claude AI</span></div>
-            <div style={{ fontSize: 10, color: "#78500c", fontFamily: "monospace", marginTop: 1, maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {contextRec ? `${contextRec.Name ?? "Exception"} · ${contextRec.Flow_Type ?? ""} · ZOID ${contextRec.ZOID}` : "No record loaded"}
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#FBBF24", letterSpacing: "0.3px" }}>Exception Analyzer</div>
+            <div style={{ fontSize: 10, color: "#78500c", fontFamily: "monospace", marginTop: 1, maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {contextRec ? `${contextRec.Name ?? "Exception"} · ${contextRec.Flow_Type ?? ""} — local analysis` : "Instant local analysis — no API needed"}
             </div>
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 9, fontWeight: 700, color: "#a06010", background: "rgba(217,119,6,0.1)", border: "1px solid rgba(217,119,6,0.22)", borderRadius: 4, padding: "2px 6px", letterSpacing: "0.4px", fontFamily: "monospace" }}>local engine</span>
           <button onClick={clearChat} title="Clear" style={{ background: "none", border: "1px solid rgba(217,119,6,0.2)", color: "#78500c", fontSize: 11, width: 24, height: 24, borderRadius: 5, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>⌫</button>
           <button onClick={onClose} style={{ background: "none", border: "1px solid rgba(217,119,6,0.2)", color: "#78500c", fontSize: 11, width: 24, height: 24, borderRadius: 5, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>✕</button>
         </div>
@@ -831,14 +843,9 @@ Format your responses clearly with sections. Be concise but thorough. Use code f
       {/* Context bar */}
       {contextRec && (
         <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "5px 14px", background: "rgba(217,119,6,0.05)", borderBottom: "1px solid rgba(217,119,6,0.1)", flexShrink: 0, flexWrap: "wrap" }}>
-          {[
-            { label: "Flow", value: contextRec.Flow_Type },
-            { label: "HTTP", value: contextRec.Statuscode },
-            { label: "Server", value: contextRec.ServerName },
-            { label: "Build", value: contextRec.BuildID },
-          ].filter(f => f.value).map(f => (
-            <span key={f.label} style={{ fontSize: 9, fontFamily: "monospace", color: "#a06010" }}>
-              <span style={{ opacity: 0.6 }}>{f.label} </span>{f.value}
+          {[["Flow", contextRec.Flow_Type], ["HTTP", contextRec.Statuscode], ["Server", contextRec.ServerName]].filter(f => f[1]).map(f => (
+            <span key={f[0]} style={{ fontSize: 9, fontFamily: "monospace", color: "#a06010" }}>
+              <span style={{ opacity: 0.6 }}>{f[0]} </span>{f[1]}
             </span>
           ))}
           <span style={{ marginLeft: "auto", fontSize: 8, fontWeight: 700, color: "#3fb950", background: "rgba(63,185,80,0.1)", border: "1px solid rgba(63,185,80,0.25)", borderRadius: 3, padding: "1px 5px", letterSpacing: "0.5px" }}>Context Loaded</span>
@@ -847,66 +854,70 @@ Format your responses clearly with sections. Be concise but thorough. Use code f
 
       {/* Messages */}
       <div style={{ flex: 1, overflowY: "auto", padding: "12px 14px", display: "flex", flexDirection: "column", gap: 10, minHeight: 0 }}>
-        {messages.length === 0 ? (
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, padding: "20px", textAlign: "center", flex: 1 }}>
+        {showWelcome ? (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, padding: "16px 0", textAlign: "center", flex: 1 }}>
             <div style={{ fontSize: 28, background: "linear-gradient(135deg,#D97706,#FBBF24)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>✦</div>
-            <div style={{ fontSize: 14, fontWeight: 700, color: "#FBBF24" }}>Claude Exception Analyzer</div>
-            <div style={{ fontSize: 11, color: "#78500c", lineHeight: 1.6, maxWidth: 320 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: "#FBBF24" }}>Exception Analyzer ready</div>
+            <div style={{ fontSize: 11, color: "#78500c", lineHeight: 1.6, maxWidth: 300 }}>
               {contextRec
-                ? `Ready to analyze: ${contextRec.Name} (${contextRec.Flow_Type} flow). Use the quick prompts below or ask anything.`
-                : "Open an exception from the modal and click \"Analyze with Claude AI\" to load context."}
+                ? `Pattern library loaded for ${contextRec.Name}. Use quick prompts or type a question.`
+                : "Open an exception record and click Analyze Exception."}
             </div>
-            {contextRec && (() => {
-              const { matches } = analyzeException(contextRec);
-              const frames = extractStackFrames(contextRec.Exception_trace);
-              const classes = extractClasses(contextRec.Exception_trace);
-              return matches.length > 0 ? (
-                <div style={{ width: "100%", background: "rgba(217,119,6,0.06)", border: "1px solid rgba(217,119,6,0.15)", borderRadius: 8, padding: "10px 12px", textAlign: "left" }}>
-                  <div style={{ fontSize: 9, fontWeight: 700, color: "#a06010", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 6 }}>Pre-analyzed patterns detected</div>
-                  {matches.map((m, i) => {
-                    const colors = { critical: "#ef4444", high: "#f97316", medium: "#eab308" };
-                    const c = colors[m.severity] ?? "#6b7280";
-                    return (
-                      <div key={i} style={{ marginBottom: 6, paddingBottom: 6, borderBottom: i < matches.length - 1 ? "1px solid rgba(217,119,6,0.1)" : "none" }}>
-                        <div style={{ fontSize: 10, fontWeight: 700, color: c, marginBottom: 2 }}>{'●'} {m.title} [{m.severity.toUpperCase()}]</div>
-                        <div style={{ fontSize: 10, color: "#a08060", lineHeight: 1.4 }}>{m.rootCause}</div>
-                      </div>
-                    );
-                  })}
-                  {frames.length > 0 && (
-                    <div style={{ marginTop: 6 }}>
-                      <div style={{ fontSize: 9, color: "#78500c", marginBottom: 3 }}>Top frames: {classes.slice(0,3).join(" → ")}</div>
-                      <div style={{ fontFamily: "monospace", fontSize: 9, color: "#664020", lineHeight: 1.5 }}>{frames.slice(0,3).join("\n")}</div>
-                    </div>
-                  )}
+            {/* Pre-analysis panel */}
+            {contextRec && preAnalysis && preAnalysis.matches.length > 0 && (
+              <div style={{ width: "100%", background: "rgba(217,119,6,0.06)", border: "1px solid rgba(217,119,6,0.15)", borderRadius: 8, padding: "10px 12px", textAlign: "left", marginTop: 6 }}>
+                <div style={{ fontSize: 9, fontWeight: 700, color: "#a06010", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 7 }}>
+                  Pre-analyzed — {preAnalysis.matches.length} pattern{preAnalysis.matches.length !== 1 ? "s" : ""} detected
                 </div>
-              ) : null;
-            })()}
+                {preAnalysis.matches.map((m, i) => {
+                  const ms = SEVERITY_STYLE[m.severity] ?? SEVERITY_STYLE.info;
+                  return (
+                    <div key={i} style={{ marginBottom: 7, paddingBottom: 7, borderBottom: i < preAnalysis.matches.length - 1 ? "1px solid rgba(217,119,6,0.1)" : "none" }}>
+                      <div style={{ fontSize: 10, fontWeight: 700, color: ms.color, marginBottom: 2 }}>{ms.label} · {m.title}</div>
+                      <div style={{ fontSize: 10, color: "#a08060", lineHeight: 1.45, marginBottom: 2 }}>
+                        <strong style={{ color: "#FBBF24" }}>Root cause:</strong> {m.rootCause}
+                      </div>
+                      <div style={{ fontSize: 10, color: "#80a080", lineHeight: 1.45 }}>
+                        <strong style={{ color: "#3fb950" }}>Fix:</strong> {m.fix}
+                      </div>
+                    </div>
+                  );
+                })}
+                {preAnalysis.frames.length > 0 && (
+                  <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid rgba(217,119,6,0.1)" }}>
+                    <div style={{ fontSize: 9, color: "#78500c", marginBottom: 3 }}>📋 Top frames: {preAnalysis.classes.slice(0,3).join(" → ")}</div>
+                    <pre style={{ fontFamily: "monospace", fontSize: 9, color: "#664020", lineHeight: 1.5, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>{preAnalysis.frames.slice(0,3).join("\n")}</pre>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         ) : messages.map((msg, i) => (
           <div key={i} style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: msg.role === "user" ? "flex-end" : "flex-start" }}>
-            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.6px", textTransform: "uppercase", opacity: 0.5, color: msg.role === "user" ? "#D97706" : "#FBBF24", padding: "0 4px" }}>{msg.role === "user" ? "You" : "Claude AI"}</div>
-            <div style={{ maxWidth: "92%", padding: "9px 12px", borderRadius: msg.role === "user" ? "10px 10px 2px 10px" : "2px 10px 10px 10px", fontSize: 11.5, lineHeight: 1.7, wordBreak: "break-word", background: msg.error ? "rgba(255,107,107,0.08)" : msg.role === "user" ? "rgba(217,119,6,0.12)" : "rgba(217,119,6,0.06)", border: `1px solid ${msg.error ? "rgba(255,107,107,0.28)" : msg.role === "user" ? "rgba(217,119,6,0.28)" : "rgba(217,119,6,0.15)"}`, color: msg.error ? "#ff9999" : msg.role === "user" ? "#fde68a" : "#e8d5b0", fontFamily: msg.role === "ai" ? "monospace" : "inherit" }}>
-              {msg.isMarkdown ? <span dangerouslySetInnerHTML={{ __html: renderContent(msg.content) }} /> : msg.content}
+            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.6px", textTransform: "uppercase", opacity: 0.5, color: msg.role === "user" ? "#D97706" : "#FBBF24", padding: "0 4px" }}>
+              {msg.role === "user" ? "You" : "Analyzer"}
+            </div>
+            <div style={{ maxWidth: "92%", padding: "9px 12px", borderRadius: msg.role === "user" ? "10px 10px 2px 10px" : "2px 10px 10px 10px", fontSize: 11.5, lineHeight: 1.65, wordBreak: "break-word", background: msg.error ? "rgba(255,107,107,0.08)" : msg.role === "user" ? "rgba(217,119,6,0.12)" : "rgba(217,119,6,0.06)", border: `1px solid ${msg.error ? "rgba(255,107,107,0.28)" : msg.role === "user" ? "rgba(217,119,6,0.28)" : "rgba(217,119,6,0.15)"}`, color: msg.error ? "#ff9999" : msg.role === "user" ? "#fde68a" : "#e8d5b0", fontFamily: msg.role === "ai" ? "monospace" : "inherit" }}>
+              {msg.isHtml ? <span dangerouslySetInnerHTML={{ __html: msg.content }} /> : msg.content}
             </div>
           </div>
         ))}
-        {streaming && (
+        {analyzing && (
           <div style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "flex-start" }}>
-            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.6px", textTransform: "uppercase", opacity: 0.5, color: "#FBBF24", padding: "0 4px" }}>Claude AI</div>
+            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.6px", textTransform: "uppercase", opacity: 0.5, color: "#FBBF24", padding: "0 4px" }}>Analyzer</div>
             <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "10px 12px", background: "rgba(217,119,6,0.06)", border: "1px solid rgba(217,119,6,0.15)", borderRadius: "2px 10px 10px 10px" }}>
               {[0, 0.2, 0.4].map((delay, j) => (
                 <span key={j} style={{ width: 5, height: 5, borderRadius: "50%", background: "#D97706", opacity: 0.5, display: "inline-block", animation: `typingBounce 1.2s ${delay}s ease-in-out infinite` }} />
               ))}
-              <span style={{ fontSize: 10, color: "#78500c", marginLeft: 6 }}>Analyzing with Claude AI…</span>
+              <span style={{ fontSize: 10, color: "#78500c", marginLeft: 6 }}>Analyzing…</span>
             </div>
           </div>
         )}
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Quick chips */}
-      {messages.length === 0 && contextRec && (
+      {/* Quick chips — shown only on welcome screen */}
+      {showWelcome && contextRec && (
         <div style={{ display: "flex", flexWrap: "wrap", gap: 5, padding: "6px 14px 4px", borderTop: "1px solid rgba(217,119,6,0.1)", flexShrink: 0 }}>
           {QUICK_PROMPTS.map(({ label, text }) => (
             <button key={label} onClick={() => sendMessage(text)} style={{ fontSize: 10, fontWeight: 600, color: "#a06010", background: "rgba(217,119,6,0.07)", border: "1px solid rgba(217,119,6,0.2)", borderRadius: 20, padding: "3px 10px", cursor: "pointer", whiteSpace: "nowrap" }}>
@@ -919,16 +930,20 @@ Format your responses clearly with sections. Be concise but thorough. Use code f
       {/* Input */}
       <div style={{ padding: "8px 12px 10px", borderTop: "1px solid rgba(217,119,6,0.15)", background: "rgba(0,0,0,0.25)", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
-          <textarea value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(input); } }}
-            placeholder="Ask Claude about this exception…" rows={1} disabled={streaming}
+          <textarea value={input} onChange={e => setInput(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(input); } }}
+            placeholder="Ask about this exception…" rows={1} disabled={analyzing}
             style={{ flex: 1, background: "rgba(217,119,6,0.05)", border: "1px solid rgba(217,119,6,0.2)", borderRadius: 8, color: "#fde68a", fontSize: 12, fontFamily: "inherit", padding: "8px 10px", resize: "none", outline: "none", lineHeight: 1.5, maxHeight: 100, overflowY: "auto" }} />
-          <button onClick={() => sendMessage(input)} disabled={streaming || !input.trim()} style={{ width: 36, height: 36, borderRadius: 8, background: "linear-gradient(135deg,#D97706,#B45309)", border: "none", color: "#fff", fontSize: 13, cursor: streaming ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, opacity: (streaming || !input.trim()) ? 0.5 : 1, boxShadow: "0 2px 12px rgba(217,119,6,0.35)" }}>
-            {streaming ? <span style={{ width: 14, height: 14, border: "2px solid rgba(255,255,255,0.25)", borderTopColor: "#fff", borderRadius: "50%", display: "inline-block", animation: "spin 0.7s linear infinite" }} /> : "➤"}
+          <button onClick={() => sendMessage(input)} disabled={analyzing || !input.trim()}
+            style={{ width: 36, height: 36, borderRadius: 8, background: "linear-gradient(135deg,#D97706,#B45309)", border: "none", color: "#fff", fontSize: 13, cursor: (analyzing || !input.trim()) ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, opacity: (analyzing || !input.trim()) ? 0.5 : 1, boxShadow: "0 2px 12px rgba(217,119,6,0.35)" }}>
+            {analyzing
+              ? <span style={{ width: 14, height: 14, border: "2px solid rgba(255,255,255,0.25)", borderTopColor: "#fff", borderRadius: "50%", display: "inline-block", animation: "spin 0.7s linear infinite" }} />
+              : "➤"}
           </button>
         </div>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 5, padding: "0 2px" }}>
           <span style={{ fontSize: 9, color: "#3a1e04", fontFamily: "monospace" }}>{msgCount} message{msgCount !== 1 ? "s" : ""}</span>
-          <span style={{ fontSize: 9, color: "#3a1e04" }}>Powered by Claude Sonnet</span>
+          <span style={{ fontSize: 9, color: "#3a1e04" }}>100% local · No API · No cost · Instant</span>
         </div>
       </div>
     </div>
